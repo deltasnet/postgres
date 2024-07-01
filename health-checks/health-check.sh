@@ -54,11 +54,10 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-#####
+. ./queries.sh
 #
 # Set print functions for colored output.
 #
-#####
 blue=$(tput setaf 5)
 green=$(tput setaf 2)
 red=$(tput setaf 1)
@@ -92,12 +91,10 @@ function ok() {
   printf "[ $(print_color "${green}" OK) ] %4s\n" "$1"
 }
 
-#####
 #
 # Set the log file path and also redirect stdout and stderr to
 # the log file as well as the console.
 #
-#####
 OUTPUT_DIR=/tmp/health-check
 SCRIPT_NAME=$(basename "$0")
 SCRIPT_PREFIX="${SCRIPT_NAME%.*}"
@@ -123,7 +120,7 @@ function lock() {
   pid=$$
   timestamp=$(date)
   if [ -e "${LOCK_FILE}" ]; then
-    err "Lock file exists at ${lOCK_FILE}: exiting"
+    err "Lock file exists at ${LOCK_FILE}: exiting"
   fi
   trap cleanup INT TERM HUP EXIT
   echo "${timestamp} ${pid}" >"${LOCK_FILE}"
@@ -237,31 +234,27 @@ function get_size() {
   esac
 }
 
-function check_user() {
+function check_run_user() {
   print_section "Check User"
 
-  if [ "$(whoami)" != "postgres" ]; then
-    err "Please run as postgres user"
+  if [ "$(whoami)" = "postgres" ] || [ "$(whoami)" = "root" ]; then
+    ok "Running as $(whoami) user"
   else
-    ok "Running as postgres user"
+    err "Please run as postgres user or root"
   fi
 }
 
-####
 #
 # Set default values for PostgreSQL variables.
 #
-####
 DEFAULT_PGHOST=localhost
 DEFAULT_PGUSER=postgres
 DEFAULT_PGPORT=5432
 DEFAULT_PGVERSION=15
 
-#####
 #
 # Set the Postgres variables.
 #
-#####
 PGVERSION="${PGVERSION:-"${DEFAULT_PGVERSION}"}"
 PGHOST="${PGHOST:-"${DEFAULT_PGHOST}"}"
 PGUSER="${PGUSER:-"${DEFAULT_PGUSER}"}"
@@ -275,11 +268,9 @@ DBS=""
 
 OUTPUT_REPORT="${OUTPUT_DIR}/health-check-report.adoc"
 
-#####
 #
 # Hardware Resources
 #
-#####
 function check_resources() {
   print_section "Check Resources"
   get_cpu
@@ -336,11 +327,9 @@ function disk_alert() {
   fi
 }
 
-#####
 #
 # Service
 #
-#####
 function check_service() {
   print_section "Check Service"
   get_service_name
@@ -372,6 +361,9 @@ function service_is_enabled() {
   fi
 }
 
+#
+# Check instance is running
+#
 function check_connection() {
   print_section "Check Connection"
   if ! pg_isready ${PGOPTS} >/dev/null; then
@@ -380,11 +372,24 @@ function check_connection() {
   ok "Connected to the database."
 }
 
+#
+# Check PGDATA
+#
 function check_pgdata() {
   print_section "Check PGDATA"
-  get_data_directory
+  get_config_files
   check_pgdata_owner
   check_pgdata_permissions
+  get_permission_mask
+}
+
+function get_config_files() {
+  find "${PGDATA}" -maxdepth 1 -type f -name "*.conf" -print0 | xargs -0 -I {} cp {} "${OUTPUT_DIR}/"
+  if [ $? -eq 0 ]; then
+    info "Config files copied to ${OUTPUT_DIR}."
+  else
+    warn "Error copying config files."
+  fi
 }
 
 function get_data_directory() {
@@ -411,8 +416,29 @@ function check_pgdata_permissions() {
   fi
 }
 
+function get_permission_mask() {
+  print_section "Get Permission Mask"
+  wrong_permission=$(find "${PGDATA}" \( -type f ! -perm 600 \) -o \( -type d ! -perm 700 \))
+  if [ -z "${wrong_permission}" ]; then
+    ok "All files and directories have correct permissions."
+  else
+    for f in ${wrong_permission}; do
+      warn "Wrong permission for file: ${f}"
+    done
+  fi
+}
+
+#
+# Get Instance Details
+#
+function get_instance_details() {
+  print_section "Get Instance Details"
+  get_databases
+  get_version
+  get_all_settings
+}
+
 function get_databases() {
-  print_section "List Databases"
   DBS=$(psql ${PGOPTS} ${PGARGS} "SELECT datname FROM pg_database WHERE datistemplate = false and datname <> 'postgres';" | awk NF)
   for db in ${DBS}; do
     info "Database: ${db}"
@@ -435,23 +461,17 @@ function get_all_settings() {
   info "All settings saved to ${output_file}."
 }
 
+#
+# Logging Checks
+#
 function check_logging() {
   print_section "Logging"
-  check_log_destination
   check_log_collector
+  check_log_destination
   check_log_directory
   check_log_file_mode
   check_log_truncate
-}
-
-function check_log_destination() {
-  local log_destination
-  log_destination=$(psql ${PGOPTS} ${PGARGS} "SHOW log_destination;")
-  if [[ -z "${log_destination// /}" ]]; then
-    warn "Log destination not set."
-  else
-    ok "Log destination is set to '${log_destination}'."
-  fi
+  check_max_log_size
 }
 
 function check_log_collector() {
@@ -461,6 +481,16 @@ function check_log_collector() {
     warn "Log collector not set"
   else
     ok "Log collector is set to '${log_collector}'."
+  fi
+}
+
+function check_log_destination() {
+  local log_destination
+  log_destination=$(psql ${PGOPTS} ${PGARGS} "SHOW log_destination;")
+  if [[ -z "${log_destination// /}" ]]; then
+    warn "Log destination not set."
+  else
+    ok "Log destination is set to '${log_destination}'."
   fi
 }
 
@@ -506,8 +536,19 @@ function check_max_log_size() {
   fi
 }
 
+#
+# Check User and Role Privileges
+#
+function check_user_privileges() {
+  print_section "Check User Privileges"
+  get_role_attributes
+  get_user_grants
+  get_user_permissions
+  check_function_privileges
+  check_replication_user
+}
+
 function get_role_attributes() {
-  print_section "Get Role Attributes"
   local output_file="${OUTPUT_DIR}/role_attributes.txt"
   psql ${PGOPTS} ${PGARGS_READABLE} "${SQL_ROLE_ATTRIBUTES}" >"${OUTPUT_DIR}/role_attributes.txt"
   cat ${output_file} | grep -v postgres
@@ -529,16 +570,70 @@ function get_user_permissions() {
   info "User permissions saved to ${output_file}."
 }
 
+function check_function_privileges() {
+  excessive=$(psql ${PGOPTS} ${PGARGS} "${PRIVILEGES}")
+
+  if [ -z "$excessive" ]; then
+    ok "No excessive function privileges granted"
+  else
+    warn "Excessive function privileges granted:"
+    echo "$excessive"
+  fi
+}
+
+function check_replication_user() {
+  repluser=$(psql ${PGOPTS} ${PGARGS} "${REPLICATION_USER}")
+
+  if [ -z "$repluser" ]; then
+    warn "No dedicated replication user found"
+  else
+    ok "Dedicated replication user exists: $repluser"
+  fi
+}
+
+#
+# Vacuuming
+#
+function check_vacuum() {
+  print_section "Check Vacuum"
+  get_not_vacuumed
+  get_vacuum_stats
+  get_transaction_wraparound
+}
+
 function get_not_vacuumed() {
-  print_section "Get Not Vacuumed for 7 days"
   for db in ${DBS}; do
     psql -d "$db" ${PGOPTS} ${PGARGS_READABLE} "${SQL_NOT_VACUUMED}" >"${OUTPUT_DIR}/${db}/not_vacuumed.txt"
     info "Tables not vacuumed for 7 days in database ${db} saved to ${OUTPUT_DIR}/${db}/not_vacuumed.txt."
   done
 }
 
+function get_vacuum_stats() {
+  for db in ${DBS}; do
+    psql -d "$db" ${PGOPTS} ${PGARGS} "${SQL_VACUUM_STATS}" >"${OUTPUT_DIR}/${db}/vacuum_stats.txt"
+    info "Vacuum stats in database ${db} saved to ${OUTPUT_DIR}/${db}/vacuum_stats.txt."
+  done
+}
+
+function get_transaction_wraparound() {
+  for db in ${DBS}; do
+    psql -d "$db" ${PGOPTS} ${PGARGS} "${SQL_TRANSACTION_WRAPAROUND}" >"${OUTPUT_DIR}/${db}/transaction_wraparound.txt"
+    info "Transaction wraparound in database ${db} saved to ${OUTPUT_DIR}/${db}/transaction_wraparound.txt."
+  done
+}
+
+#
+# Indexes
+#
+function check_indexes() {
+  print_section "Check Indexes"
+  get_unused_indexes
+  get_duplicate_indexes
+  get_index_utiliation
+  get_largest_tables
+}
+
 function get_unused_indexes() {
-  print_section "Get Unused Indexes"
   for db in ${DBS}; do
     psql -d "$db" ${PGOPTS} ${PGARGS} "${SQL_UNUSED_INDEXES}" >"${OUTPUT_DIR}/${db}/unused_indexes.txt"
     info "Unused indexes in database ${db} saved to ${OUTPUT_DIR}/${db}/unused_indexes.txt."
@@ -546,7 +641,6 @@ function get_unused_indexes() {
 }
 
 function get_duplicate_indexes() {
-  print_section "Get Duplicate Indexes"
   for db in ${DBS}; do
     psql -d "$db" ${PGOPTS} ${PGARGS} "${SQL_DUPLICATE_INDEXES}" >"${OUTPUT_DIR}/${db}/duplicate_indexes.txt"
     info "Duplicate indexes in database ${db} saved to ${OUTPUT_DIR}/${db}/duplicate_indexes.txt."
@@ -554,7 +648,6 @@ function get_duplicate_indexes() {
 }
 
 function get_index_utiliation() {
-  print_section "Get Index Utilization"
   for db in ${DBS}; do
     psql -d "$db" ${PGOPTS} ${PGARGS} "${SQL_INDEX_UTILIZATION}" >"${OUTPUT_DIR}/${db}/index_utilization.txt"
     info "Index utilization in database ${db} saved to ${OUTPUT_DIR}/${db}/index_utilization.txt."
@@ -569,46 +662,122 @@ function get_largest_tables() {
   done
 }
 
-function get_vacuum_stats() {
-  print_section "Get Vacuum Stats"
-  for db in ${DBS}; do
-    psql -d "$db" ${PGOPTS} ${PGARGS} "${SQL_VACUUM_STATS}" >"${OUTPUT_DIR}/${db}/vacuum_stats.txt"
-    info "Vacuum stats in database ${db} saved to ${OUTPUT_DIR}/${db}/vacuum_stats.txt."
-  done
+function check_packages() {
+  print_section "Check Packages"
+  check_authorized_repos
+  check_pgaudit_enabled
 }
 
-function get_transaction_wraparound() {
-  print_section "Get Transaction Wraparound"
-  for db in ${DBS}; do
-    psql -d "$db" ${PGOPTS} ${PGARGS} "${SQL_TRANSACTION_WRAPAROUND}" >"${OUTPUT_DIR}/${db}/transaction_wraparound.txt"
-    info "Transaction wraparound in database ${db} saved to ${OUTPUT_DIR}/${db}/transaction_wraparound.txt."
-  done
+function get_os() {
+  print_section "Get OS"
+  local os
+  os="$(cat /etc/os-release)"
+  info "OS: $os"
+  echo "$os"
 }
 
-function get_permission_mask() {
-  print_section "Get Permission Mask"
-  wrong_permission=$(find "${PGDATA}" \( -type f ! -perm 600 \) -o \( -type d ! -perm 700 \))
-  if [ -z "${wrong_permission}" ]; then
-    ok "All files and directories have correct permissions."
+function check_authorized_repos() {
+  if [ -f /etc/redhat-release ]; then
+    check_redhat_repos
+  elif [ -f /etc/debian_version ]; then
+    check_debian_repos
+  elif [ -f /etc/arch-release ]; then
+    check_arch_repos
   else
-    for f in ${wrong_permission}; do
-      warn "Wrong permission for file: ${f}"
-    done
+    warn "Unknown OS"
   fi
 }
 
-function get_config_files() {
-  print_section "Get Config Files"
-  find "${PGDATA}" -maxdepth 1 -type f -name "*.conf" -print0 | xargs -0 -I {} cp {} "${OUTPUT_DIR}/"
-  if [ $? -eq 0 ]; then
-    info "Config files copied to ${OUTPUT_DIR}."
+function check_redhat_repos() {
+  local os_user
+  os_user="$(whoami)"
+  if [ "$os_user" != "root" ]; then
+    warn "Please run as root"
+    return
+  fi
+
+  while read -r line; do
+    info "$line"
+  done < <(dnf info "$(rpm -qa | grep postgres)" | grep -E '^Name|^Version|^From')
+}
+
+function check_debian_repos() {
+  local os_user
+  os_user="$(whoami)"
+  if [ "$os_user" != "root" ]; then
+    warn "Please run as root"
+    return
+  fi
+
+  local installed_packages
+  installed_packages=$(dpkg-query -W -f='${binary:Package}\n' | grep -i postgres)
+
+  for package in $installed_packages; do
+    info "Package: $package"
+    version=$(dpkg-query -W -f='${Version}\n' $package)
+    info "Version: $version"
+    from_repo=$(apt-cache policy $package | grep -E '^\s*500\s*http' | head -n 1 | awk '{print $3}')
+    info "From: $from_repo"
+    echo
+  done
+}
+
+function check_arch_repos() {
+  expected_repo="extra"
+  if pacman-conf --repo-list | grep -q "${expected_repo}"; then
+    ok "Packages obtained from authorized repositories"
   else
-    warn "Error copying config files."
+    warn "Packages not obtained from authorized repositories"
   fi
 }
 
-function get_replication_info() {
-  print_section "Get Replication Info"
+function check_pgaudit_enabled() {
+  extensions=$(psql ${PGOPTS} ${PGARGS} "SELECT * FROM pg_available_extensions WHERE name='pgaudit';" | grep pgaudit)
+
+  if [ -z "$extensions" ]; then
+    warn "pgaudit extension is not enabled"
+  else
+    ok "pgaudit extension is enabled"
+  fi
+}
+
+#
+# Functions for checking connections
+#
+function check_connections() {
+  print_section "Check Connections"
+  check_local_connection
+  check_host_connection
+}
+
+function check_local_connection() {
+  local_auth=$(grep '^local' $PGDATA/pg_hba.conf)
+
+  if echo "$local_auth" | grep -q 'peer'; then
+    ok "Local connections use 'peer' authentication"
+  else
+    warn "Local connections not using 'peer' authentication"
+  fi
+}
+
+function check_host_connection() {
+  host_auth=$(grep '^host' $PGDATA/pg_hba.conf)
+
+  if echo "$host_auth" | grep -q 'scram-sha-256'; then
+    ok "Host connections use 'scram-sha-256' authentication"
+  else
+    warn "Host connections not using 'scram-sha-256' authentication"
+  fi
+}
+
+#
+# Functions for checking replication
+#
+function check_replication() {
+  print_section "Check Replication"
+  check_replication_logging
+  check_wal_archive
+  check_replication_params
   local is_slave=$(psql ${PGOPTS} ${PGARGS} "${IS_SLAVE}")
   if [ "${is_slave}" = "f" ]; then
     info "This is a read/write instance."
@@ -621,354 +790,101 @@ function get_replication_info() {
   fi
 }
 
+function check_replication_logging() {
+  print_section "Check Replication Logging"
+  log_level=$(psql ${PGOPTS} ${PGARGS} "SHOW log_replication_commands;")
+
+  if [ "$log_level" = "on" ]; then
+    ok "Replication command logging is enabled"
+  else
+    warn "Replication command logging is not enabled"
+  fi
+}
+
+function check_wal_archive() {
+  print_section "Check WAL Archiving"
+  archive_mode=$(psql ${PGOPTS} ${PGARGS} "SHOW archive_mode;")
+  archive_command=$(psql ${PGOPTS} ${PGARGS} "SHOW archive_command;")
+
+  if [ "$archive_mode" = "on" ] && [ -n "$archive_command" ]; then
+    ok "WAL archiving is enabled and configured"
+  else
+    warn "WAL archiving is not enabled or configured"
+  fi
+}
+
+function check_replication_params() {
+  print_section "Check Replication Parameters"
+  params=$(psql ${PGOPTS} ${PGARGS} "
+        SELECT name, setting 
+        FROM pg_settings  
+        WHERE name IN ('max_wal_senders', 'wal_keep_segments');
+    ")
+
+  if echo "$params" | grep -q "max_wal_senders | [1-9]"; then
+    ok "max_wal_senders is configured"
+  else
+    warn "max_wal_senders is not properly configured"
+  fi
+
+  if echo "$params" | grep -q "wal_keep_segments | [1-9]"; then
+    ok "wal_keep_segments is configured"
+  else
+    warn "wal_keep_segments is not properly configured"
+  fi
+}
+
 function get_replication_stats_primary() {
-  print_subsection "Replication Stats"
-  psql ${PGOPTS} ${PGARGS_READABLE} "${REPLICATION_STATS_PRIMARY}" >"${OUTPUT_DIR}/replication_stats.txt"
-  info "Replication stats saved to ${OUTPUT_DIR}/replication_stats.txt."
+  if [ "$(psql ${PGOPTS} ${PGARGS} 'SELECT count(*) FROM pg_stat_replication')" -eq 0 ]; then
+    warn "No replication configured."
+  else
+    psql ${PGOPTS} ${PGARGS_READABLE} "${REPLICATION_STATS_PRIMARY}" >"${OUTPUT_DIR}/replication_stats.txt"
+    info "Replication stats saved to ${OUTPUT_DIR}/replication_stats.txt."
+  fi
 }
 
 function get_replication_stats_standby() {
-  print_subsection "Replication Stats"
-  psql ${PGOPTS} ${PGARGS_READABLE} "${REPLICATION_STATS_STANDBY}" >"${OUTPUT_DIR}/replication_stats.txt"
-  info "Replication stats saved to ${OUTPUT_DIR}/replication_stats.txt."
+  if [ "$(psql ${PGOPTS} ${PGARGS} "SELECT count(*) FROM pg_stat_wal_receiver")" -eq 0 ]; then
+    warn "No replication configured."
+    return
+  else
+    psql ${PGOPTS} ${PGARGS_READABLE} "${REPLICATION_STATS_STANDBY}" >"${OUTPUT_DIR}/replication_stats.txt"
+    info "Replication stats saved to ${OUTPUT_DIR}/replication_stats.txt."
+  fi
 }
 
 function get_replication_slots() {
-  print_subsection "Replication Slots"
-  psql ${PGOPTS} ${PGARGS} "${REPLICATION_SLOTS}" >"${OUTPUT_DIR}/replication_slots.txt"
-  info "Replication slots in database ${db} saved to ${OUTPUT_DIR}/replication_slots.txt."
+  if [ $(psql ${PGOPTS} ${PGARGS} "SELECT count(*) FROM pg_replication_slots") -eq 0 ]; then
+    warn "No replication slots configured."
+    return
+  else
+    psql ${PGOPTS} ${PGARGS} "${REPLICATION_SLOTS}" >"${OUTPUT_DIR}/replication_slots.txt"
+    info "Replication slots in database ${db} saved to ${OUTPUT_DIR}/replication_slots.txt."
+  fi
 }
 
 function get_replication_lag() {
-  print_subsection "Replication Lag"
   psql ${PGOPTS} ${PGARGS} "${REPLICATION_LAG}" >"${OUTPUT_DIR}/replication_lag.txt"
   info "Replication lag saved to ${OUTPUT_DIR}/replication_lag.txt."
 }
 
-SQL_GRANTS="
-      SELECT grantee AS user, CONCAT(table_schema, '.', table_name) AS table,
-         CASE
-            WHEN COUNT(privilege_type) = 7 THEN 'ALL'
-            ELSE ARRAY_TO_STRING(ARRAY_AGG(privilege_type), ', ')
-         END AS grants
-      FROM information_schema.role_table_grants where grantee not in ('PUBLIC', 'postgres', 'pg_read_all_stats')
-      GROUP BY table_name, table_schema, grantee;
-"
+#
+# Function for checking encryption
+#
+function check_encryption() {
+  print_section "Check Encryption"
+  check_pgcrypto
+}
 
-SQL_ROLE_ATTRIBUTES="
-  SELECT r.rolname, r.rolsuper, r.rolinherit,
-  r.rolcreaterole, r.rolcreatedb, r.rolcanlogin,
-  r.rolconnlimit, r.rolvaliduntil
-  , r.rolreplication
-  , r.rolbypassrls
-  FROM pg_catalog.pg_roles r
-  WHERE r.rolname not like 'pg_%'
-  ORDER BY 1;
-"
+function check_pgcrypto() {
+  extensions=$(psql ${PGOPTS} -c "SELECT * FROM pg_available_extensions WHERE name='pgcrypto';" | grep pgcrypto)
 
-SQL_NOT_VACUUMED="
-  SELECT CONCAT(schemaname,
-  relname),
-  now() - last_autovacuum AS noautovac,
-  now() - last_vacuum AS novac,
-  n_tup_upd,
-  n_tup_del,
-  pg_size_pretty(pg_total_relation_size(schemaname||'.'
-  ||relname)),
-  autovacuum_count,
-  last_autovacuum,
-  vacuum_count,
-  last_vacuum
-  FROM pg_stat_user_tables
-  WHERE (now() - last_autovacuum > '7 days'::interval OR now() - last_vacuum >'7 days'::interval )
-  OR (last_autovacuum IS NULL AND last_vacuum IS NULL )
-  ORDER BY novac DESC;
-
-"
-
-SQL_UNUSED_INDEXES="
-  SELECT 
-    relname AS table, 
-    indexrelname AS index, 
-    pg_size_pretty(pg_relation_size(indexrelid)) AS size
-  FROM 
-    pg_stat_user_indexes
-  WHERE 
-    idx_scan = 0
-  ORDER BY pg_relation_size(indexrelid) DESC;
-"
-
-SQL_INDEX_UTILIZATION="
-  SELECT
-    schemaname, 
-    relname, 
-    indexrelname, 
-    idx_scan, 
-    idx_tup_fetch,
-    idx_tup_read
-  FROM 
-    pg_stat_user_indexes
-  ORDER BY 4 DESC,1,2,3;
-"
-
-SQL_VACUUM_STATS="
-  WITH table_opts AS (
-      SELECT
-        pg_class.oid, relname, nspname, array_to_string(reloptions, '') AS relopts
-      FROM
-         pg_class INNER JOIN pg_namespace ns ON relnamespace = ns.oid
-    ), vacuum_settings AS (
-      SELECT
-        oid, relname, nspname,
-        CASE
-          WHEN relopts LIKE '%autovacuum_vacuum_threshold%'
-            THEN substring(relopts, '.*autovacuum_vacuum_threshold=([0-9.]+).*')::integer
-            ELSE current_setting('autovacuum_vacuum_threshold')::integer
-          END AS autovacuum_vacuum_threshold,
-        CASE
-          WHEN relopts LIKE '%autovacuum_vacuum_scale_factor%'
-            THEN substring(relopts, '.*autovacuum_vacuum_scale_factor=([0-9.]+).*')::real
-            ELSE current_setting('autovacuum_vacuum_scale_factor')::real
-          END AS autovacuum_vacuum_scale_factor
-      FROM
-        table_opts
-    )
-    SELECT
-      vacuum_settings.nspname AS schema,
-      vacuum_settings.relname AS table,
-      to_char(psut.last_vacuum, 'YYYY-MM-DD HH24:MI') AS last_vacuum,
-      to_char(psut.last_autovacuum, 'YYYY-MM-DD HH24:MI') AS last_autovacuum,
-      to_char(pg_class.reltuples, '9G999G999G999') AS rowcount,
-      to_char(psut.n_dead_tup, '9G999G999G999') AS dead_rowcount,
-      to_char(autovacuum_vacuum_threshold
-           + (autovacuum_vacuum_scale_factor::numeric * pg_class.reltuples), '9G999G999G999') AS autovacuum_threshold,
-      CASE
-        WHEN autovacuum_vacuum_threshold + (autovacuum_vacuum_scale_factor::numeric * pg_class.reltuples) < psut.n_dead_tup
-        THEN 'yes'
-      END AS expect_autovacuum
-    FROM
-      pg_stat_user_tables psut INNER JOIN pg_class ON psut.relid = pg_class.oid
-        INNER JOIN vacuum_settings ON pg_class.oid = vacuum_settings.oid
-    ORDER BY 1;
-"
-
-SQL_TRANSACTION_WRAPAROUND="
-  WITH max_age AS (
-    SELECT 2000000000 as max_old_xid
-      , setting AS autovacuum_freeze_max_age
-    FROM 
-      pg_catalog.pg_settings
-    WHERE 
-      name = 'autovacuum_freeze_max_age' 
-  ), 
-  per_database_stats AS (
-    SELECT datname
-      , m.max_old_xid::int
-      , m.autovacuum_freeze_max_age::int
-      , age(d.datfrozenxid) AS oldest_current_xid
-    FROM 
-      pg_catalog.pg_database d
-    JOIN 
-      max_age m ON (true)
-    WHERE d.datallowconn
-  )
-  SELECT max(oldest_current_xid) AS oldest_current_xid
-      , max(ROUND(100*(oldest_current_xid/max_old_xid::float))) AS percent_towards_wraparound
-      , max(ROUND(100*(oldest_current_xid/autovacuum_freeze_max_age::float))) AS percent_towards_emergency_autovac
-  FROM per_database_stats;
-"
-
-SQL_DUPLICATE_INDEXES="
-  SELECT 
-    indrelid::regclass AS table, 
-    indkey AS column_numbers,
-    array_agg(indexrelid::regclass) AS indexes, 
-    pg_catalog.pg_get_expr(indpred, indrelid, true) AS expression
-  FROM 
-    pg_index
-  GROUP BY 
-    indrelid, 
-    indkey, 
-    pg_catalog.pg_get_expr(indpred,indrelid, true)
-  HAVING count(*) > 1;
-"
-
-SQL_LARGEST_TABLE="
-  SELECT 
-    QUOTE_IDENT(TABLE_SCHEMA)||'.'||QUOTE_IDENT(table_name) as table_name,
-    pg_relation_size(QUOTE_IDENT(TABLE_SCHEMA)||'.'|| QUOTE_IDENT(table_name)) as size,
-    pg_total_relation_size(QUOTE_IDENT(TABLE_SCHEMA)||'.'|| QUOTE_IDENT(table_name)) as total_size,
-    pg_size_pretty(pg_relation_size(QUOTE_IDENT(TABLE_SCHEMA)||'.'||QUOTE_IDENT(table_name))) as pretty_relation_size,
-    pg_size_pretty(pg_total_relation_size(QUOTE_IDENT(TABLE_SCHEMA)||'.'||QUOTE_IDENT(table_name))) as pretty_total_relation_size 
-  FROM 
-    information_schema.tables 
-  WHERE 
-    QUOTE_IDENT(TABLE_SCHEMA) NOT IN ('snapshots') 
-  ORDER BY 
-    size DESC LIMIT 10;
-"
-
-USER_PERMISSIONS="
-    WITH roles AS (
-        SELECT
-            r.oid,
-            r.rolname AS username,
-            ARRAY(
-                SELECT b.rolname
-                FROM pg_catalog.pg_auth_members m
-                JOIN pg_catalog.pg_roles b ON (m.roleid = b.oid)
-                WHERE m.member = r.oid
-            ) AS roles,
-            CASE
-                WHEN r.rolsuper THEN 'superuser'
-                WHEN r.rolcreaterole THEN 'create role'
-                WHEN r.rolcreatedb THEN 'create database'
-                ELSE 'normal'
-            END AS privilege,
-            r.rolcreatedb AS can_create_db,
-            r.rolcanlogin AS can_login,
-            r.rolreplication AS can_replicate,
-            r.rolconnlimit AS connection_limit,
-            r.rolvaliduntil AS password_expiry,
-            r.rolconfig AS config,
-            r.rolvaliduntil::date AS expiry_date,
-            r.rolpassword IS NOT NULL AS has_password
-        FROM
-            pg_catalog.pg_roles r
-        WHERE
-            r.rolname NOT LIKE 'pg_%'
-    ),
-    table_grants AS (
-        SELECT
-            grantee,
-            schemaname,
-            tablename,
-            array_agg(privilege_type ORDER BY privilege_type) AS privileges
-        FROM
-            (
-                SELECT
-                    r.rolname AS grantee,
-                    n.nspname AS schemaname,
-                    c.relname AS tablename,
-                    CASE
-                        WHEN has_table_privilege(r.oid, c.oid, 'SELECT') THEN 'SELECT'
-                        WHEN has_table_privilege(r.oid, c.oid, 'INSERT') THEN 'INSERT'
-                        WHEN has_table_privilege(r.oid, c.oid, 'UPDATE') THEN 'UPDATE'
-                        WHEN has_table_privilege(r.oid, c.oid, 'DELETE') THEN 'DELETE'
-                        WHEN has_table_privilege(r.oid, c.oid, 'TRUNCATE') THEN 'TRUNCATE'
-                        WHEN has_table_privilege(r.oid, c.oid, 'REFERENCES') THEN 'REFERENCES'
-                        WHEN has_table_privilege(r.oid, c.oid, 'TRIGGER') THEN 'TRIGGER'
-                    END AS privilege_type
-                FROM
-                    pg_catalog.pg_class c
-                    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-                    CROSS JOIN pg_catalog.pg_roles r
-                WHERE
-                    c.relkind IN ('r', 'v', 'm', 'f', 'p')
-                    AND r.rolname NOT LIKE 'pg_%'
-                    AND n.nspname NOT LIKE 'pg_%'
-                    AND n.nspname != 'information_schema'
-            ) AS subquery
-        WHERE
-            privilege_type IS NOT NULL
-        GROUP BY
-            grantee, schemaname, tablename
-    ),
-    grants_agg AS (
-        SELECT
-            grantee,
-            string_agg(
-                CASE
-                    WHEN schemaname = 'public'
-                    THEN tablename
-                    ELSE schemaname || '.' || tablename
-                END ||
-                ': ' || array_to_string(privileges, ', '),
-                E'\n'
-            ) AS table_grants
-        FROM
-            table_grants
-        WHERE
-            schemaname NOT LIKE 'pg_%' OR schemaname != 'information_schema'
-        GROUP BY
-            grantee
-    ),
-    database_grants AS (
-        SELECT
-            r.rolname AS grantee,
-            string_agg(DISTINCT 'Database ' || d.datname || ': ' ||
-                CASE
-                    WHEN has_database_privilege(r.oid, d.oid, 'CREATE') THEN 'CREATE'
-                    WHEN has_database_privilege(r.oid, d.oid, 'CONNECT') THEN 'CONNECT'
-                    WHEN has_database_privilege(r.oid, d.oid, 'TEMPORARY') THEN 'TEMPORARY'
-                END,
-                E'\n'
-            ) AS db_grants
-        FROM
-            pg_catalog.pg_database d
-            CROSS JOIN pg_catalog.pg_roles r
-        WHERE
-            r.rolname NOT LIKE 'pg_%'
-            AND has_database_privilege(r.oid, d.oid, 'CREATE,CONNECT,TEMPORARY')
-        GROUP BY
-            r.rolname
-    )
-    SELECT
-        r.username,
-        r.roles,
-        r.privilege,
-        r.can_create_db,
-        r.can_login,
-        r.can_replicate,
-        r.connection_limit,
-        r.password_expiry,
-        r.config,
-        r.expiry_date,
-        r.has_password,
-        COALESCE(g.table_grants, 'No specific table grants') AS table_grants,
-        COALESCE(d.db_grants, 'No specific database grants') AS database_grants,
-        pg_catalog.shobj_description(r.oid, 'pg_authid') AS description
-    FROM
-        roles r
-    LEFT JOIN
-        grants_agg g ON r.username = g.grantee
-    LEFT JOIN
-        database_grants d ON r.username = d.grantee
-    ORDER BY
-        r.username;    
-"
-
-IS_SLAVE="
-  SELECT pg_is_in_recovery();
-"
-
-REPLICATION_LAG="
-  SELECT CASE
-    WHEN pg_last_wal_receive_lsn () = pg_last_wal_replay_lsn ()
-      THEN 0
-    ELSE
-      extract ( epoch from now () - pg_last_xact_replay_timestamp () )
-    END 
-  AS log_delay ;    
-"
-
-REPLICATION_STATS_PRIMARY="
-  SELECT
-  *
-  FROM
-  pg_stat_replication;
-"
-REPLICATION_STATS_STANDBY="
-  SELECT *
-  FROM pg_stat_wal_receiver;
-"
-
-REPLICATION_SLOTS="
-  SELECT
-  *
-  FROM
-    pg_replication_slots;
-"
+  if [ -z "$extensions" ]; then
+    warn "pgcrypto extension is not installed"
+  else
+    ok "pgcrypto extension is installed"
+  fi
+}
 
 function print_section_console() {
   local width=80
@@ -1024,28 +940,20 @@ function log_cleanup() {
 function main() {
   init
   parse_params
-  check_user
+  check_run_user
+  get_data_directory
   check_resources
   check_service
   check_connection
   check_pgdata
-  check_pgdata
-  check_pgdata_permissions
-  get_permission_mask
+  get_instance_details
   check_logging
-  get_databases
-  get_version
-  get_all_settings
-  get_role_attributes
-  get_user_grants
-  get_user_permissions
-  get_not_vacuumed
-  get_unused_indexes
-  get_index_utiliation
-  get_vacuum_stats
-  get_transaction_wraparound
-  get_config_files
-  get_replication_info
+  check_vacuum
+  check_indexes
+  check_packages
+  check_connections
+  check_replication
+  check_encryption
   log_cleanup
 }
 
