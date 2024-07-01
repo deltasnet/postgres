@@ -1,0 +1,258 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS CloudFormation template for PostgreSQL Patroni with HA setup and passwordless SSH access.
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: PatroniVPC
+
+  MainSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: MainSubnet
+
+  DRSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: DRSubnet
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: RouteTable
+
+  Route:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  MainSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref MainSubnet
+      RouteTableId: !Ref RouteTable
+
+  DRSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DRSubnet
+      RouteTableId: !Ref RouteTable
+
+  MainSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow traffic for Patroni cluster
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5400
+          ToPort: 5400
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8008
+          ToPort: 8008
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 6400
+          ToPort: 6400
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 2379
+          ToPort: 2379
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 2380
+          ToPort: 2380
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5005
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 7000
+          ToPort: 7000
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  MainInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref MainEC2Role
+
+  MainEC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+
+  MainEC2Policy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: MainEC2Policy
+      Roles:
+        - !Ref MainEC2Role
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ec2:DescribeInstances
+              - ec2:DescribeRegions
+            Resource: "*"
+
+  DRInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref DRRole
+
+  DRRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+
+  DRPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: DRPolicy
+      Roles:
+        - !Ref DRRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ec2:DescribeInstances
+              - ec2:DescribeRegions
+            Resource: "*"
+
+  MainLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: ami-0abcdef1234567890
+      InstanceType: t2.small
+      IamInstanceProfile: !Ref MainInstanceProfile
+      SecurityGroups:
+        - !Ref MainSecurityGroup
+      KeyName: your-key-name
+      UserData: !Base64 |
+        #!/bin/bash
+        yum update -y
+        yum install -y epel-release
+        yum install -y postgresql-server patroni etcd haproxy pgbouncer
+        # Create SSH directory and set permissions
+        mkdir -p /home/ec2-user/.ssh
+        chmod 700 /home/ec2-user/.ssh
+        # Fetch the public key from the Ansible instance
+        aws s3 cp s3://your-bucket-name/ansible_pub_key /home/ec2-user/.ssh/authorized_keys
+        chmod 600 /home/ec2-user/.ssh/authorized_keys
+        chown -R ec2-user:ec2-user /home/ec2-user/.ssh
+        # Start and enable necessary services
+        systemctl enable postgresql patroni etcd haproxy pgbouncer
+        systemctl start postgresql patroni etcd haproxy pgbouncer
+
+  DRLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: ami-0abcdef1234567890
+      InstanceType: t2.small
+      IamInstanceProfile: !Ref DRInstanceProfile
+      SecurityGroups:
+        - !Ref MainSecurityGroup
+      KeyName: your-key-name
+      UserData: !Base64 |
+        #!/bin/bash
+        yum update -y
+        yum install -y epel-release
+        yum install -y postgresql-server patroni etcd haproxy pgbouncer
+        # Create SSH directory and set permissions
+        mkdir -p /home/ec2-user/.ssh
+        chmod 700 /home/ec2-user/.ssh
+        # Fetch the public key from the Ansible instance
+        aws s3 cp s3://your-bucket-name/ansible_pub_key /home/ec2-user/.ssh/authorized_keys
+        chmod 600 /home/ec2-user/.ssh/authorized_keys
+        chown -R ec2-user:ec2-user /home/ec2-user/.ssh
+        # Start and enable necessary services
+        systemctl enable postgresql patroni etcd haproxy pgbouncer
+        systemctl start postgresql patroni etcd haproxy pgbouncer
+
+  MainAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref MainSubnet
+      LaunchConfigurationName: !Ref MainLaunchConfig
+      MinSize: '6'
+      MaxSize: '6'
+      DesiredCapacity: '6'
+
+  DRAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref DRSubnet
+      LaunchConfigurationName: !Ref DRLaunchConfig
+      MinSize: '6'
+      MaxSize: '6'
+      DesiredCapacity: '6'
+
+  MainAnsibleInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.medium
+      ImageId: ami-0abcdef1234567890
+      SubnetId: !Ref MainSubnet
+      SecurityGroupIds:
+        - !Ref MainSecurityGroup
+      KeyName: your-key-name
+      IamInstanceProfile: !Ref MainInstanceProfile
+      UserData: !Base64 |
+        #!/bin/bash
+        yum
+

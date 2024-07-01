@@ -1,0 +1,63 @@
+services:
+  pg_primary:
+    image: pgsql:latest # Use the tag you used for your custom PostgreSQL image
+    container_name: pg_primary
+    environment:
+      POSTGRES_REPLICATION_ROLE: primary
+      POSTGRES_PASSWORD: mysecretpassword
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+    networks:
+      - postgres_network
+    ports:
+      - "5432:5432"
+      - "2222:22"
+    volumes:
+      - backup:/backup
+
+  pg_replica1:
+    image: pgsql:latest
+    depends_on:
+      - pg_primary
+    container_name: pg_replica1
+    environment:
+      POSTGRES_REPLICATION_ROLE: replica
+      POSTGRES_PRIMARY_HOST: pg_primary
+      POSTGRES_PRIMARY_PORT: 5432
+      POSTGRES_REPLICATION_USER: postgres
+      POSTGRES_REPLICATION_PASSWORD: mysecretpassword
+      POSTGRES_REPLICATION_SLOT: slot_replica1
+    networks:
+      - postgres_network
+    ports:
+      - "5433:5432"
+      - "2223:22"
+    volumes:
+      - backup:/backup
+
+  pg_replica2:
+    image: pgsql:latest
+    depends_on:
+      - pg_primary
+    container_name: pg_replica2
+    environment:
+      POSTGRES_REPLICATION_ROLE: replica
+      POSTGRES_PRIMARY_HOST: pg_primary
+      POSTGRES_PRIMARY_PORT: 5432
+      POSTGRES_REPLICATION_USER: postgres
+      POSTGRES_REPLICATION_PASSWORD: mysecretpassword
+      POSTGRES_REPLICATION_SLOT: slot_replica2
+    networks:
+      - postgres_network
+    ports:
+      - "5434:5432"
+      - "2224:22"
+    volumes:
+      - backup:/backup
+
+networks:
+  postgres_network:
+    driver: bridge
+
+volumes:
+  backup:

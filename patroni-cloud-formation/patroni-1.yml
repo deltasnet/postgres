@@ -1,0 +1,451 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for PostgreSQL Patroni cluster'
+
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instances
+    Type: AWS::EC2::KeyPair::KeyName
+
+  VpcCIDR:
+    Description: IP range for the VPC
+    Type: String
+    Default: 10.0.0.0/16
+
+  MainSubnetCIDR:
+    Description: IP range for the main Patroni cluster subnet
+    Type: String
+    Default: 10.0.1.0/24
+
+  DRSubnetCIDR:
+    Description: IP range for the DR Patroni cluster subnet
+    Type: String
+    Default: 10.0.2.0/24
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: PatroniVPC
+
+  MainSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref MainSubnetCIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: MainSubnet
+
+  DRSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref DRSubnetCIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: DRSubnet
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: PublicRouteTable
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  MainSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref MainSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  DRSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DRSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for DB instances
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5400
+          ToPort: 5400
+          SourceSecurityGroupId: !Ref DBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 8008
+          ToPort: 8008
+          SourceSecurityGroupId: !Ref DBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 6400
+          ToPort: 6400
+          SourceSecurityGroupId: !Ref DBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 2379
+          ToPort: 2379
+          SourceSecurityGroupId: !Ref ETCDSecurityGroup
+
+  ETCDSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for ETCD instances
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2379
+          ToPort: 2379
+          SourceSecurityGroupId: !Ref DBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 2380
+          ToPort: 2380
+          SourceSecurityGroupId: !Ref ETCDSecurityGroup
+
+  HAProxySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for HAProxy instances
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8008
+          ToPort: 8008
+          SourceSecurityGroupId: !Ref DBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5005
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 7000
+          ToPort: 7000
+          CidrIp: 0.0.0.0/0
+
+  AnsibleSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Ansible instances
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  DBRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  DBInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref DBRole
+
+  ETCDRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  ETCDInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref ETCDRole
+
+  AnsibleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  AnsibleInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref AnsibleRole
+
+  MainDBLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: MainDBLaunchTemplate
+      LaunchTemplateData:
+        ImageId: ami-0ba62214afa52bec7  # RHEL 9 AMI
+        InstanceType: t2.small
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Arn: !GetAtt DBInstanceProfile.Arn
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups:
+              - !Ref DBSecurityGroup
+
+  MainDBInstance1:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref MainDBLaunchTemplate
+        Version: !GetAtt MainDBLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref MainSubnet
+      Tags:
+        - Key: Name
+          Value: MainDBInstance1
+
+  MainDBInstance2:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref MainDBLaunchTemplate
+        Version: !GetAtt MainDBLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref MainSubnet
+      Tags:
+        - Key: Name
+          Value: MainDBInstance2
+
+  MainDBInstance3:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref MainDBLaunchTemplate
+        Version: !GetAtt MainDBLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref MainSubnet
+      Tags:
+        - Key: Name
+          Value: MainDBInstance3
+
+  DRDBLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: DRDBLaunchTemplate
+      LaunchTemplateData:
+        ImageId: ami-0ba62214afa52bec7  # RHEL 9 AMI
+        InstanceType: t2.small
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Arn: !GetAtt DBInstanceProfile.Arn
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups:
+              - !Ref DBSecurityGroup
+
+  DRDBInstance1:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref DRDBLaunchTemplate
+        Version: !GetAtt DRDBLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref DRSubnet
+      Tags:
+        - Key: Name
+          Value: DRDBInstance1
+
+  DRDBInstance2:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref DRDBLaunchTemplate
+        Version: !GetAtt DRDBLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref DRSubnet
+      Tags:
+        - Key: Name
+          Value: DRDBInstance2
+
+  DRDBInstance3:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref DRDBLaunchTemplate
+        Version: !GetAtt DRDBLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref DRSubnet
+      Tags:
+        - Key: Name
+          Value: DRDBInstance3
+
+  MainETCDLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: MainETCDLaunchTemplate
+      LaunchTemplateData:
+        ImageId: ami-0ba62214afa52bec7  # RHEL 9 AMI
+        InstanceType: t2.small
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Arn: !GetAtt ETCDInstanceProfile.Arn
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups:
+              - !Ref ETCDSecurityGroup
+              - !Ref HAProxySecurityGroup
+
+  MainETCDInstance1:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref MainETCDLaunchTemplate
+        Version: !GetAtt MainETCDLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref MainSubnet
+      Tags:
+        - Key: Name
+          Value: MainETCDInstance1
+
+  MainETCDInstance2:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref MainETCDLaunchTemplate
+        Version: !GetAtt MainETCDLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref MainSubnet
+      Tags:
+        - Key: Name
+          Value: MainETCDInstance2
+
+  MainETCDInstance3:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref MainETCDLaunchTemplate
+        Version: !GetAtt MainETCDLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref MainSubnet
+      Tags:
+        - Key: Name
+          Value: MainETCDInstance3
+
+  DRETCDLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: DRETCDLaunchTemplate
+      LaunchTemplateData:
+        ImageId: ami-0ba62214afa52bec7  # RHEL 9 AMI
+        InstanceType: t2.small
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Arn: !GetAtt ETCDInstanceProfile.Arn
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups:
+              - !Ref ETCDSecurityGroup
+              - !Ref HAProxySecurityGroup
+
+  DRETCDInstance1:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref DRETCDLaunchTemplate
+        Version: !GetAtt DRETCDLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref DRSubnet
+      Tags:
+        - Key: Name
+          Value: DRETCDInstance1
+
+  DRETCDInstance2:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref DRETCDLaunchTemplate
+        Version: !GetAtt DRETCDLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref DRSubnet
+      Tags:
+        - Key: Name
+          Value: DRETCDInstance2
+
+  DRETCDInstance3:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref DRETCDLaunchTemplate
+        Version: !GetAtt DRETCDLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref DRSubnet
+      Tags:
+        - Key: Name
+          Value: DRETCDInstance3
+
+  MainETCDElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  MainETCDElasticIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      EIP: !Ref MainETCDElasticIP
+      InstanceId: !Ref MainETCDInstance1
+
+  DRETCDElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  DRETCDElasticIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      EIP: !Ref DRETCDElasticIP
+      InstanceId: !Ref DRETCDInstance1
+
+  AnsibleLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: AnsibleLaunchTemplate
